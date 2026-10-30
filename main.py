@@ -1,15 +1,54 @@
-from __future__ import division
+"""Minecraft-inspired voxel sandbox, modernized for Python 3.14 and Pyglet 2.1."""
 
-import sys
+from __future__ import annotations
+
 import math
 import random
 import time
-
 from collections import deque
-from pyglet import image
-from pyglet.gl import *
-from pyglet.graphics import TextureGroup
+from pathlib import Path
+
+import pyglet
+from pyglet import image, shapes
+from pyglet.gl import (
+    GL_BACK,
+    GL_CULL_FACE,
+    GL_DEPTH_TEST,
+    GL_LINES,
+    GL_NEAREST,
+    GL_TEXTURE0,
+    GL_TEXTURE_MAG_FILTER,
+    GL_TEXTURE_MIN_FILTER,
+    GL_TRIANGLES,
+    glActiveTexture,
+    glBindTexture,
+    glClearColor,
+    glCullFace,
+    glEnable,
+    glTexParameteri,
+    glViewport,
+)
+from pyglet.graphics.shader import Shader, ShaderProgram
+from pyglet.math import Mat4, Vec3
 from pyglet.window import key, mouse
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    """Convert a dotted version string into an integer tuple."""
+    parts = []
+    for part in version.split("."):
+        digits = "".join(character for character in part if character.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+if _version_tuple(pyglet.version) < (2, 1, 0):
+    raise RuntimeError(
+        "This version requires Pyglet 2.1.0 or newer. "
+        "Install it with: python -m pip install --upgrade pyglet==2.1.19"
+    )
 
 TICKS_PER_SEC = 60
 
@@ -34,7 +73,7 @@ TERMINAL_VELOCITY = 50
 PLAYER_HEIGHT = 2
 
 if sys.version_info[0] >= 3:
-    xrange = range
+    range = range
 
 def cube_vertices(x, y, z, n):
     """ Return the vertices of the cube at position x, y, z with size 2*n.
@@ -74,7 +113,7 @@ def tex_coords(top, bottom, side):
     return result
 
 
-TEXTURE_PATH = 'texture.png'
+TEXTURE_PATH = Path(__file__).resolve().parent / "texture.png"
 
 GRASS = tex_coords((1, 0), (0, 1), (0, 0))
 SAND = tex_coords((1, 1), (1, 1), (1, 1))
@@ -89,6 +128,159 @@ FACES = [
     ( 0, 0, 1),
     ( 0, 0,-1),
 ]
+
+BLOCK_VERTEX_SHADER = """#version 150 core
+in vec3 position;
+in vec2 tex_coords;
+
+out vec2 v_tex_coords;
+out float v_camera_distance;
+
+uniform WindowBlock
+{
+    mat4 projection;
+    mat4 view;
+} window;
+
+void main()
+{
+    vec4 camera_position = window.view * vec4(position, 1.0);
+    gl_Position = window.projection * camera_position;
+    v_tex_coords = tex_coords;
+    v_camera_distance = length(camera_position.xyz);
+}
+"""
+
+BLOCK_FRAGMENT_SHADER = """#version 150 core
+in vec2 v_tex_coords;
+in float v_camera_distance;
+
+uniform sampler2D u_texture;
+uniform vec3 u_fog_color;
+uniform float u_fog_start;
+uniform float u_fog_end;
+
+out vec4 final_color;
+
+void main()
+{
+    vec4 texel = texture(u_texture, v_tex_coords);
+    float visibility = clamp(
+        (u_fog_end - v_camera_distance) / (u_fog_end - u_fog_start),
+        0.0,
+        1.0
+    );
+    final_color = vec4(mix(u_fog_color, texel.rgb, visibility), texel.a);
+}
+"""
+
+FOCUS_VERTEX_SHADER = """#version 150 core
+in vec3 position;
+
+uniform WindowBlock
+{
+    mat4 projection;
+    mat4 view;
+} window;
+
+void main()
+{
+    gl_Position = window.projection * window.view * vec4(position, 1.0);
+}
+"""
+
+FOCUS_FRAGMENT_SHADER = """#version 150 core
+out vec4 final_color;
+
+void main()
+{
+    final_color = vec4(0.0, 0.0, 0.0, 1.0);
+}
+"""
+
+
+def create_shader_program(vertex_source: str, fragment_source: str) -> ShaderProgram:
+    """Compile and link a Pyglet 2 shader program."""
+    return ShaderProgram(
+        Shader(vertex_source, "vertex"),
+        Shader(fragment_source, "fragment"),
+    )
+
+
+class TextureBindGroup(pyglet.graphics.Group):
+    """Bind the block atlas and shader while a Pyglet batch is rendered."""
+
+    def __init__(self, texture, program: ShaderProgram):
+        super().__init__()
+        self.texture = texture
+        self.program = program
+
+    def set_state(self):
+        self.program.use()
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(self.texture.target, self.texture.id)
+
+    def unset_state(self):
+        self.program.stop()
+
+    def __eq__(self, other):
+        return (
+            type(self) is type(other)
+            and self.texture.id == other.texture.id
+            and self.program is other.program
+            and self.parent == other.parent
+        )
+
+    def __hash__(self):
+        return hash((self.texture.id, id(self.program), self.parent))
+
+
+def quad_to_triangles(values, components: int) -> list[float]:
+    """Convert a sequence of four-vertex faces into OpenGL triangles."""
+    if components <= 0 or len(values) % (components * 4):
+        raise ValueError("Quad data must contain complete four-vertex faces.")
+
+    result = []
+    triangle_order = (0, 1, 2, 0, 2, 3)
+    vertices_per_face = 4
+
+    for offset in range(0, len(values), components * vertices_per_face):
+        face = [
+            values[offset + index * components:offset + (index + 1) * components]
+            for index in range(vertices_per_face)
+        ]
+        for index in triangle_order:
+            result.extend(face[index])
+
+    return result
+
+
+def cube_edge_vertices(x, y, z, half_size=0.51) -> list[float]:
+    """Return the 24 vertices that form the 12 edges of a cube."""
+    edges = []
+
+    for sy in (-1, 1):
+        for sz in (-1, 1):
+            edges.append(((x - half_size, y + sy * half_size, z + sz * half_size),
+                          (x + half_size, y + sy * half_size, z + sz * half_size)))
+
+    for sx in (-1, 1):
+        for sz in (-1, 1):
+            edges.append(((x + sx * half_size, y - half_size, z + sz * half_size),
+                          (x + sx * half_size, y + half_size, z + sz * half_size)))
+
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            edges.append(((x + sx * half_size, y + sy * half_size, z - half_size),
+                          (x + sx * half_size, y + sy * half_size, z + half_size)))
+
+    return [
+        coordinate
+        for edge in edges
+        for point in edge
+        for coordinate in point
+    ]
+
 
 
 def normalize(position):
@@ -130,27 +322,40 @@ class Model(object):
 
     def __init__(self):
 
-        # A Batch is a collection of vertex lists for batched rendering.
         self.batch = pyglet.graphics.Batch()
+        self.texture = image.load(str(TEXTURE_PATH)).get_texture()
 
-        # A TextureGroup manages an OpenGL texture.
-        self.group = TextureGroup(image.load(TEXTURE_PATH).get_texture())
+        # Keep the atlas crisp, as intended for pixel-art block textures.
+        glBindTexture(self.texture.target, self.texture.id)
+        glTexParameteri(self.texture.target, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+        glTexParameteri(self.texture.target, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
 
-        # A mapping from position to the texture of the block at that position.
-        # This defines all the blocks that are currently in the world.
+        self.program = create_shader_program(
+            BLOCK_VERTEX_SHADER,
+            BLOCK_FRAGMENT_SHADER,
+        )
+        self.program.use()
+        self.program["u_texture"] = 0
+        self.program["u_fog_color"] = (0.5, 0.69, 1.0)
+        self.program["u_fog_start"] = 20.0
+        self.program["u_fog_end"] = 60.0
+        self.program.stop()
+
+        self.group = TextureBindGroup(self.texture, self.program)
+
+        # All blocks in the world, keyed by their integer grid position.
         self.world = {}
 
-        # Same mapping as `world` but only contains blocks that are shown.
+        # Blocks that should currently be visible.
         self.shown = {}
 
-        # Mapping from position to a pyglet `VertextList` for all shown blocks.
+        # Pyglet VertexLists for visible blocks.
         self._shown = {}
 
-        # Mapping from sector to a list of positions inside that sector.
+        # Position lists grouped by sector for visibility management.
         self.sectors = {}
 
-        # Simple function queue implementation. The queue is populated with
-        # _show_block() and _hide_block() calls
+        # Deferred GPU operations, processed gradually by the update loop.
         self.queue = deque()
 
         self._initialize()
@@ -162,19 +367,19 @@ class Model(object):
         n = 80  # 1/2 width and height of world
         s = 1  # step size
         y = 0  # initial y height
-        for x in xrange(-n, n + 1, s):
-            for z in xrange(-n, n + 1, s):
+        for x in range(-n, n + 1, s):
+            for z in range(-n, n + 1, s):
                 # create a layer stone an grass everywhere.
                 self.add_block((x, y - 2, z), GRASS, immediate=False)
                 self.add_block((x, y - 3, z), STONE, immediate=False)
                 if x in (-n, n) or z in (-n, n):
                     # create outer walls.
-                    for dy in xrange(-2, 3):
+                    for dy in range(-2, 3):
                         self.add_block((x, y + dy, z), STONE, immediate=False)
 
         # generate the hills randomly
         o = n - 10
-        for _ in xrange(120):
+        for _ in range(120):
             a = random.randint(-o, o)  # x position of the hill
             b = random.randint(-o, o)  # z position of the hill
             c = -1  # base of the hill
@@ -182,9 +387,9 @@ class Model(object):
             s = random.randint(4, 8)  # 2 * s is the side length of the hill
             d = 1  # how quickly to taper off the hills
             t = random.choice([GRASS, SAND, BRICK])
-            for y in xrange(c, c + h):
-                for x in xrange(a - s, a + s + 1):
-                    for z in xrange(b - s, b + s + 1):
+            for y in range(c, c + h):
+                for x in range(a - s, a + s + 1):
+                    for z in range(b - s, b + s + 1):
                         if (x - a) ** 2 + (z - b) ** 2 > (s + 1) ** 2:
                             continue
                         if (x - 0) ** 2 + (z - 0) ** 2 < 5 ** 2:
@@ -211,7 +416,7 @@ class Model(object):
         x, y, z = position
         dx, dy, dz = vector
         previous = None
-        for _ in xrange(max_distance * m):
+        for _ in range(max_distance * m):
             key = normalize((x, y, z))
             if key != previous and key in self.world:
                 return key, previous
@@ -310,25 +515,21 @@ class Model(object):
             self._enqueue(self._show_block, position, texture)
 
     def _show_block(self, position, texture):
-        """ Private implementation of the `show_block()` method.
+        """Create a batched, textured block using modern triangle primitives."""
+        vertex_data = quad_to_triangles(
+            cube_vertices(*position, 0.5),
+            components=3,
+        )
+        texture_data = quad_to_triangles(texture, components=2)
 
-        Parameters
-        ----------
-        position : tuple of len 3
-            The (x, y, z) position of the block to show.
-        texture : list of len 3
-            The coordinates of the texture squares. Use `tex_coords()` to
-            generate.
-
-        """
-        x, y, z = position
-        vertex_data = cube_vertices(x, y, z, 0.5)
-        texture_data = list(texture)
-        # create vertex list
-        # FIXME Maybe `add_indexed()` should be used instead
-        self._shown[position] = self.batch.add(24, GL_QUADS, self.group,
-            ('v3f/static', vertex_data),
-            ('t2f/static', texture_data))
+        self._shown[position] = self.program.vertex_list(
+            36,
+            GL_TRIANGLES,
+            batch=self.batch,
+            group=self.group,
+            position=("f", vertex_data),
+            tex_coords=("f", texture_data),
+        )
 
     def hide_block(self, position, immediate=True):
         """ Hide the block at the given `position`. Hiding does not remove the
@@ -381,9 +582,9 @@ class Model(object):
         before_set = set()
         after_set = set()
         pad = 4
-        for dx in xrange(-pad, pad + 1):
-            for dy in [0]:  # xrange(-pad, pad + 1):
-                for dz in xrange(-pad, pad + 1):
+        for dx in range(-pad, pad + 1):
+            for dy in [0]:  # range(-pad, pad + 1):
+                for dz in range(-pad, pad + 1):
                     if dx ** 2 + dy ** 2 + dz ** 2 > (pad + 1) ** 2:
                         continue
                     if before:
@@ -434,67 +635,54 @@ class Model(object):
 class Window(pyglet.window.Window):
 
     def __init__(self, *args, **kwargs):
-        super(Window, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
-        # Whether or not the window exclusively captures the mouse.
         self.exclusive = False
-
-        # When flying gravity has no effect and speed is increased.
         self.flying = False
-
-        # Strafing is moving lateral to the direction you are facing,
-        # e.g. moving to the left or right while continuing to face forward.
-        #
-        # First element is -1 when moving forward, 1 when moving back, and 0
-        # otherwise. The second element is -1 when moving left, 1 when moving
-        # right, and 0 otherwise.
         self.strafe = [0, 0]
-
-        # Current (x, y, z) position in the world, specified with floats. Note
-        # that, perhaps unlike in math class, the y-axis is the vertical axis.
-        self.position = (0, 0, 0)
-
-        # First element is rotation of the player in the x-z plane (ground
-        # plane) measured from the z-axis down. The second is the rotation
-        # angle from the ground plane up. Rotation is in degrees.
-        #
-        # The vertical plane rotation ranges from -90 (looking straight down) to
-        # 90 (looking straight up). The horizontal rotation range is unbounded.
-        self.rotation = (0, 0)
-
-        # Which sector the player is currently in.
+        self.position = (0.0, 0.0, 0.0)
+        self.rotation = (0.0, 0.0)
         self.sector = None
+        self.dy = 0.0
 
-        # The crosshairs at the center of the screen.
-        self.reticle = None
-
-        # Velocity in the y (upward) direction.
-        self.dy = 0
-
-        # A list of blocks the player can place. Hit num keys to cycle.
         self.inventory = [BRICK, GRASS, SAND]
-
-        # The current block the user can place. Hit num keys to cycle.
         self.block = self.inventory[0]
-
-        # Convenience list of num keys.
         self.num_keys = [
             key._1, key._2, key._3, key._4, key._5,
-            key._6, key._7, key._8, key._9, key._0]
+            key._6, key._7, key._8, key._9, key._0,
+        ]
 
-        # Instance of the model that handles the world.
         self.model = Model()
 
-        # The label that is displayed in the top left of the canvas.
-        self.label = pyglet.text.Label('', font_name='Arial', font_size=18,
-            x=10, y=self.height - 10, anchor_x='left', anchor_y='top',
-            color=(0, 0, 0, 255))
+        self.label = pyglet.text.Label(
+            "",
+            font_name="Arial",
+            font_size=18,
+            x=10,
+            y=max(10, self.height - 10),
+            anchor_x="left",
+            anchor_y="top",
+            color=(0, 0, 0, 255),
+        )
 
-        # This call schedules the `update()` method to be called
-        # TICKS_PER_SEC. This is the main game event loop.
+        self.focus_program = create_shader_program(
+            FOCUS_VERTEX_SHADER,
+            FOCUS_FRAGMENT_SHADER,
+        )
+        self.focus_vertices = self.focus_program.vertex_list(
+            24,
+            GL_LINES,
+            position=("f", (0.0,) * 72),
+        )
+
+        self.reticle_batch = pyglet.graphics.Batch()
+        self.reticle_lines = []
+        self._create_reticle()
+        self.on_resize(self.width, self.height)
+
         pyglet.clock.schedule_interval(self.update, 1.0 / TICKS_PER_SEC)
 
-    def set_exclusive_mouse(self, exclusive):
+    def set_exclusive_mouse(self, exclusive):    def set_exclusive_mouse(self, exclusive):
         """ If `exclusive` is True, the game will capture the mouse, if False
         the game will ignore the mouse.
 
@@ -577,7 +765,7 @@ class Window(pyglet.window.Window):
             self.sector = sector
         m = 8
         dt = min(dt, 0.2)
-        for _ in xrange(m):
+        for _ in range(m):
             self._update(dt / m)
 
     def _update(self, dt):
@@ -634,14 +822,14 @@ class Window(pyglet.window.Window):
         p = list(position)
         np = normalize(position)
         for face in FACES:  # check all surrounding blocks
-            for i in xrange(3):  # check each dimension independently
+            for i in range(3):  # check each dimension independently
                 if not face[i]:
                     continue
                 # How much overlap you have with this dimension.
                 d = (p[i] - np[i]) * face[i]
                 if d < pad:
                     continue
-                for dy in xrange(height):  # check each height
+                for dy in range(height):  # check each height
                     op = list(np)
                     op[1] -= dy
                     op[i] += face[i]
@@ -680,7 +868,7 @@ class Window(pyglet.window.Window):
                 # ON OSX, control + left click = right click.
                 if previous:
                     self.model.add_block(previous, self.block)
-            elif button == pyglet.window.mouse.LEFT and block:
+            elif button == mouse.LEFT and block:
                 texture = self.model.world[block]
                 if texture != STONE:
                     self.model.remove_block(block)
@@ -758,83 +946,124 @@ class Window(pyglet.window.Window):
         elif symbol == key.D:
             self.strafe[1] -= 1
 
-    def on_resize(self, width, height):
-        """ Called when the window is resized to a new `width` and `height`.
+    def _create_reticle(self):
+        """Rebuild the 2D crosshair after a window resize."""
+        for line in self.reticle_lines:
+            line.delete()
 
-        """
-        # label
-        self.label.y = height - 10
-        # reticle
-        if self.reticle:
-            self.reticle.delete()
-        x, y = self.width // 2, self.height // 2
-        n = 10
-        self.reticle = pyglet.graphics.vertex_list(4,
-            ('v2i', (x - n, y, x + n, y, x, y - n, x, y + n))
+        self.reticle_batch = pyglet.graphics.Batch()
+        center_x = self.width // 2
+        center_y = self.height // 2
+        half_length = 10
+
+        self.reticle_lines = [
+            shapes.Line(
+                center_x - half_length,
+                center_y,
+                center_x + half_length,
+                center_y,
+                thickness=1.0,
+                color=(0, 0, 0, 255),
+                batch=self.reticle_batch,
+            ),
+            shapes.Line(
+                center_x,
+                center_y - half_length,
+                center_x,
+                center_y + half_length,
+                thickness=1.0,
+                color=(0, 0, 0, 255),
+                batch=self.reticle_batch,
+            ),
+        ]
+
+    def on_resize(self, width, height):
+        """Update the viewport and perspective projection when resized."""
+        framebuffer_width, framebuffer_height = self.get_framebuffer_size()
+        glViewport(
+            0,
+            0,
+            max(1, framebuffer_width),
+            max(1, framebuffer_height),
         )
 
-    def set_2d(self):
-        """ Configure OpenGL to draw in 2d.
+        safe_width = max(1, width)
+        safe_height = max(1, height)
+        self.projection = Mat4.perspective_projection(
+            safe_width / float(safe_height),
+            z_near=0.1,
+            z_far=60.0,
+            fov=65.0,
+        )
 
-        """
-        width, height = self.get_size()
-        glDisable(GL_DEPTH_TEST)
-        viewport = self.get_viewport_size()
-        glViewport(0, 0, max(1, viewport[0]), max(1, viewport[1]))
-        glMatrixMode(GL_PROJECTION)
-        glLoadIdentity()
-        glOrtho(0, max(1, width), 0, max(1, height), -1, 1)
-        glMatrixMode(GL_MODELVIEW)
-        glLoadIdentity()
+        if hasattr(self, "label"):
+            self.label.y = height - 10
+        if hasattr(self, "reticle_batch"):
+            self._create_reticle()
+
+        return pyglet.event.EVENT_HANDLED
+
+    def set_2d(self):
+        """Switch the Pyglet WindowBlock matrices to a 2D HUD projection."""
+        width = max(1, self.width)
+        height = max(1, self.height)
+        self.view = Mat4()
+        self.projection = Mat4.orthogonal_projection(
+            0,
+            width,
+            0,
+            height,
+            -1,
+            1,
+        )
 
     def set_3d(self):
-        """ Configure OpenGL to draw in 3d.
+        """Update the modern camera matrices used by the voxel shaders."""
+        width = max(1, self.width)
+        height = max(1, self.height)
+        self.projection = Mat4.perspective_projection(
+            width / float(height),
+            z_near=0.1,
+            z_far=60.0,
+            fov=65.0,
+        )
 
-        """
-        width, height = self.get_size()
-        glEnable(GL_DEPTH_TEST)
-        viewport = self.get_viewport_size()
-        glViewport(0, 0, max(1, viewport[0]), max(1, viewport[1]))
-        glMatrixMode(GL_PROJECTION)
-        glLoadIdentity()
-        gluPerspective(65.0, width / float(height), 0.1, 60.0)
-        glMatrixMode(GL_MODELVIEW)
-        glLoadIdentity()
-        x, y = self.rotation
-        glRotatef(x, 0, 1, 0)
-        glRotatef(-y, math.cos(math.radians(x)), 0, math.sin(math.radians(x)))
+        direction = self.get_sight_vector()
         x, y, z = self.position
-        glTranslatef(-x, -y, -z)
+        dx, dy, dz = direction
+        eye = Vec3(x, y, z)
+        target = Vec3(x + dx, y + dy, z + dz)
+
+        # Avoid a singular view matrix when looking almost straight up/down.
+        up = Vec3(0.0, 0.0, 1.0) if abs(dy) > 0.999 else Vec3(0.0, 1.0, 0.0)
+        self.view = Mat4.look_at(eye, target, up)
 
     def on_draw(self):
-        """ Called by pyglet to draw the canvas.
-
-        """
+        """Render the 3D world, selected-block outline, and 2D HUD."""
         self.clear()
         self.set_3d()
-        glColor3d(1, 1, 1)
         self.model.batch.draw()
         self.draw_focused_block()
+
         self.set_2d()
         self.draw_label()
         self.draw_reticle()
 
     def draw_focused_block(self):
-        """ Draw black edges around the block that is currently under the
-        crosshairs.
-
-        """
+        """Draw a thin black wireframe around the block under the crosshair."""
         vector = self.get_sight_vector()
         block = self.model.hit_test(self.position, vector)[0]
-        if block:
-            x, y, z = block
-            vertex_data = cube_vertices(x, y, z, 0.51)
-            glColor3d(0, 0, 0)
-            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
-            pyglet.graphics.draw(24, GL_QUADS, ('v3f/static', vertex_data))
-            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+        if block is None:
+            return
 
-    def draw_label(self):
+        self.focus_vertices.position = cube_edge_vertices(*block, half_size=0.51)
+        self.focus_program.use()
+        try:
+            self.focus_vertices.draw(GL_LINES)
+        finally:
+            self.focus_program.stop()
+
+    def draw_label(self):    def draw_label(self):
         """ Draw the label in the top left of the screen.
 
         """
@@ -845,49 +1074,17 @@ class Window(pyglet.window.Window):
         self.label.draw()
 
     def draw_reticle(self):
-        """ Draw the crosshairs in the center of the screen.
+        """Draw the centered crosshair using Pyglet's modern 2D shapes API."""
+        self.reticle_batch.draw()
 
-        """
-        glColor3d(0, 0, 0)
-        self.reticle.draw(GL_LINES)
-
-
-def setup_fog():
-    """ Configure the OpenGL fog properties.
-
-    """
-    # Enable fog. Fog "blends a fog color with each rasterized pixel fragment's
-    # post-texturing color."
-    glEnable(GL_FOG)
-    # Set the fog color.
-    glFogfv(GL_FOG_COLOR, (GLfloat * 4)(0.5, 0.69, 1.0, 1))
-    # Say we have no preference between rendering speed and quality.
-    glHint(GL_FOG_HINT, GL_DONT_CARE)
-    # Specify the equation used to compute the blending factor.
-    glFogi(GL_FOG_MODE, GL_LINEAR)
-    # How close and far away fog starts and ends. The closer the start and end,
-    # the denser the fog in the fog range.
-    glFogf(GL_FOG_START, 20.0)
-    glFogf(GL_FOG_END, 60.0)
 
 
 def setup():
-    """ Basic OpenGL configuration.
-
-    """
-    # Set the color of "clear", i.e. the sky, in rgba.
-    glClearColor(0.5, 0.69, 1.0, 1)
-    # Enable culling (not rendering) of back-facing facets -- facets that aren't
-    # visible to you.
+    """Configure the depth-tested, back-face-culled 3D scene."""
+    glClearColor(0.5, 0.69, 1.0, 1.0)
+    glEnable(GL_DEPTH_TEST)
     glEnable(GL_CULL_FACE)
-    # Set the texture minification/magnification function to GL_NEAREST (nearest
-    # in Manhattan distance) to the specified texture coordinates. GL_NEAREST
-    # "is generally faster than GL_LINEAR, but it can produce textured images
-    # with sharper edges because the transition between texture elements is not
-    # as smooth."
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
-    setup_fog()
+    glCullFace(GL_BACK)
 
 
 def main():
