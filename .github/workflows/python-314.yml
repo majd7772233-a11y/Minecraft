@@ -27,3 +27,5 @@ jobs:
       - name: Verify geometry conversion helpers
         run: |
           python -c "import main; assert len(main.quad_to_triangles(main.cube_vertices(0, 0, 0, 0.5), 3)) == 108; assert len(main.quad_to_triangles(main.GRASS, 2)) == 72; assert len(main.cube_edge_vertices(0, 0, 0)) == 72; print('Python 3.14 import and geometry checks passed.')"
+          python -c "import main; counter = main.FPSCounter(0.5); values = [counter.tick(i / 60) for i in range(31)]; assert abs(values[-1] - 60.0) < 0.001; assert counter.tick(0.5) == values[-1]; print('FPS counter checks passed.')"
+          python -c "from pathlib import Path; source = Path('main.py').read_text(encoding='utf-8'); assert 'pyglet.clock.get_fps' not in source; assert 'GL_QUADS' not in source; assert 'GL_FOG' not in source; print('Legacy Pyglet/OpenGL API scan passed.')"
