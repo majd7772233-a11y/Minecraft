@@ -72,9 +72,6 @@ TERMINAL_VELOCITY = 50
 
 PLAYER_HEIGHT = 2
 
-if sys.version_info[0] >= 3:
-    range = range
-
 def cube_vertices(x, y, z, n):
     """ Return the vertices of the cube at position x, y, z with size 2*n.
 
@@ -682,7 +679,7 @@ class Window(pyglet.window.Window):
 
         pyglet.clock.schedule_interval(self.update, 1.0 / TICKS_PER_SEC)
 
-    def set_exclusive_mouse(self, exclusive):    def set_exclusive_mouse(self, exclusive):
+    def set_exclusive_mouse(self, exclusive):
         """ If `exclusive` is True, the game will capture the mouse, if False
         the game will ignore the mouse.
 
@@ -1063,7 +1060,7 @@ class Window(pyglet.window.Window):
         finally:
             self.focus_program.stop()
 
-    def draw_label(self):    def draw_label(self):
+    def draw_label(self):
         """ Draw the label in the top left of the screen.
 
         """
