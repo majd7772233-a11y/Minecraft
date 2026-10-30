@@ -281,6 +281,51 @@ def cube_edge_vertices(x, y, z, half_size=0.51) -> list[float]:
 
 
 
+class FPSCounter:
+    """Measure rendered frames per second without relying on removed clock APIs."""
+
+    def __init__(self, update_interval: float = 0.5):
+        if update_interval <= 0:
+            raise ValueError("update_interval must be greater than zero.")
+
+        self.update_interval = float(update_interval)
+        self.fps = 0.0
+        self._last_time = None
+        self._elapsed = 0.0
+        self._frames = 0
+
+    def tick(self, now: float | None = None) -> float:
+        """Record one rendered frame and return the most recent FPS estimate.
+
+        The optional timestamp makes the counter deterministic in unit tests.
+        Normal game execution uses a monotonic high-resolution performance clock.
+        """
+        current_time = time.perf_counter() if now is None else float(now)
+
+        if self._last_time is None:
+            self._last_time = current_time
+            return self.fps
+
+        delta = current_time - self._last_time
+        self._last_time = current_time
+
+        # Ignore zero-length or backwards time steps (for example, test clocks
+        # or a platform clock adjustment) rather than dividing by zero.
+        if delta <= 0:
+            return self.fps
+
+        self._elapsed += delta
+        self._frames += 1
+
+        if self._elapsed >= self.update_interval:
+            self.fps = self._frames / self._elapsed
+            self._elapsed = 0.0
+            self._frames = 0
+
+        return self.fps
+
+
+
 def normalize(position):
     """ Accepts `position` of arbitrary precision and returns the block
     containing that position.
@@ -651,6 +696,7 @@ class Window(pyglet.window.Window):
         ]
 
         self.model = Model()
+        self.fps_counter = FPSCounter(update_interval=0.5)
 
         self.label = pyglet.text.Label(
             "",
@@ -1068,8 +1114,9 @@ class Window(pyglet.window.Window):
 
         """
         x, y, z = self.position
+        fps = int(round(self.fps_counter.tick()))
         self.label.text = '%02d (%.2f, %.2f, %.2f) %d / %d' % (
-            pyglet.clock.get_fps(), x, y, z,
+            fps, x, y, z,
             len(self.model._shown), len(self.model.world))
         self.label.draw()
 
