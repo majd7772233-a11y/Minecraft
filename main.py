@@ -23,6 +23,7 @@ from pyglet.gl import (
     glActiveTexture,
     glBindTexture,
     glClearColor,
+    glDisable,
     glCullFace,
     glEnable,
     glTexParameteri,
@@ -1002,6 +1003,7 @@ class Window(pyglet.window.Window):
 
     def set_2d(self):
         """Switch the Pyglet WindowBlock matrices to a 2D HUD projection."""
+        glDisable(GL_DEPTH_TEST)
         width = max(1, self.width)
         height = max(1, self.height)
         self.view = Mat4()
@@ -1016,6 +1018,7 @@ class Window(pyglet.window.Window):
 
     def set_3d(self):
         """Update the modern camera matrices used by the voxel shaders."""
+        glEnable(GL_DEPTH_TEST)
         width = max(1, self.width)
         height = max(1, self.height)
         self.projection = Mat4.perspective_projection(
